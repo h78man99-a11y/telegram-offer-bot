@@ -1,0 +1,606 @@
+import os
+import json
+import requests
+from flask import Flask, request
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Configuration from Environment Variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+MONGODB_URI = os.getenv("MONGODB_URI", "YOUR_MONGODB_URI")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@YOUR_CHANNEL_NAME")
+OFFER18_URL = os.getenv("OFFER18_URL", "https://offer18.com")
+
+# Validate configuration
+if TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+    raise ValueError("⚠️ TELEGRAM_TOKEN not configured. Check your .env file")
+if MONGODB_URI == "YOUR_MONGODB_URI":
+    raise ValueError("⚠️ MONGODB_URI not configured. Check your .env file")
+if ADMIN_ID == 0:
+    raise ValueError("⚠️ ADMIN_ID not configured. Check your .env file")
+
+# MongoDB Setup
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    client.server_info()  # Test connection
+    db = client['telegram_bot']
+    users_collection = db['users']
+    help_requests_collection = db['help_requests']
+    banned_users_collection = db['banned_users']
+    print("✅ MongoDB connected successfully")
+except Exception as e:
+    print(f"❌ MongoDB Connection Error: {e}")
+    raise
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# ==================== DATABASE FUNCTIONS ====================
+
+def get_or_create_user(user_id, username, first_name):
+    """Get or create user in database"""
+    user = users_collection.find_one({'_id': user_id})
+    if not user:
+        users_collection.insert_one({
+            '_id': user_id,
+            'username': username or f'user_{user_id}',
+            'first_name': first_name or 'User',
+            'joined_channels': [],
+            'created_at': datetime.utcnow(),
+            'help_requests_today': 0,
+            'last_help_request_date': None,
+            'is_active': True,
+            'current_mode': None
+        })
+        return users_collection.find_one({'_id': user_id})
+    return user
+
+def is_user_banned(user_id):
+    """Check if user is banned"""
+    return banned_users_collection.find_one({'_id': user_id}) is not None
+
+def ban_user(user_id):
+    """Ban a user"""
+    if not is_user_banned(user_id):
+        banned_users_collection.insert_one({'_id': user_id, 'banned_at': datetime.utcnow()})
+        users_collection.update_one({'_id': user_id}, {'$set': {'is_active': False}})
+        return True
+    return False
+
+def unban_user(user_id):
+    """Unban a user"""
+    if banned_users_collection.delete_one({'_id': user_id}).deleted_count > 0:
+        users_collection.update_one({'_id': user_id}, {'$set': {'is_active': True}})
+        return True
+    return False
+
+def get_total_users():
+    """Get total active users"""
+    return users_collection.count_documents({'is_active': True})
+
+def get_banned_users_count():
+    """Get total banned users"""
+    return banned_users_collection.count_documents({})
+
+def check_channel_membership(user_id, channel_username):
+    """Check if user is member of channel"""
+    try:
+        # Remove @ if present
+        channel = channel_username.replace('@', '')
+        url = f"{TELEGRAM_API}/getChatMember?chat_id=@{channel}&user_id={user_id}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        if data['ok']:
+            status = data['result']['status']
+            return status not in ['left', 'kicked']
+        return False
+    except Exception as e:
+        print(f"Channel check error: {e}")
+        return False
+
+def can_send_help_request(user_id):
+    """Check if user can send help request (max 2 per day)"""
+    user = users_collection.find_one({'_id': user_id})
+    if not user:
+        return True, None
+    
+    today = datetime.utcnow().date()
+    last_date = user.get('last_help_request_date')
+    
+    if last_date and last_date.date() == today:
+        if user.get('help_requests_today', 0) >= 2:
+            return False, "❌ You have reached your daily limit (2 messages/day). Try again tomorrow."
+    return True, None
+
+def add_help_request(user_id, username, message):
+    """Add help request to database"""
+    today = datetime.utcnow().date()
+    user = users_collection.find_one({'_id': user_id})
+    
+    if user:
+        last_date = user.get('last_help_request_date')
+        if last_date and last_date.date() != today:
+            users_collection.update_one(
+                {'_id': user_id},
+                {'$set': {'help_requests_today': 1, 'last_help_request_date': datetime.utcnow()}}
+            )
+        else:
+            users_collection.update_one(
+                {'_id': user_id},
+                {'$inc': {'help_requests_today': 1}, '$set': {'last_help_request_date': datetime.utcnow()}}
+            )
+    
+    help_requests_collection.insert_one({
+        'user_id': user_id,
+        'username': username,
+        'message': message,
+        'created_at': datetime.utcnow()
+    })
+
+# ==================== TELEGRAM FUNCTIONS ====================
+
+def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    """Send a message to user"""
+    url = f"{TELEGRAM_API}/sendMessage"
+    data = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': parse_mode
+    }
+    if reply_markup:
+        data['reply_markup'] = json.dumps(reply_markup)
+    
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        return None
+
+def answer_callback_query(callback_query_id, text, show_alert=False):
+    """Answer callback query"""
+    url = f"{TELEGRAM_API}/answerCallbackQuery"
+    data = {
+        'callback_query_id': callback_query_id,
+        'text': text,
+        'show_alert': show_alert
+    }
+    try:
+        requests.post(url, json=data, timeout=5)
+    except:
+        pass
+
+def home_keyboard():
+    """Return home keyboard"""
+    return {
+        'inline_keyboard': [
+            [{'text': '🎁 Offers', 'callback_data': 'offers'}],
+            [{'text': '💬 Help & Support', 'callback_data': 'help'}],
+            [{'text': '📢 Join Channel', 'callback_data': 'join_channel'}]
+        ]
+    }
+
+def home_keyboard_admin():
+    """Return home keyboard for admin"""
+    keyboard = home_keyboard()
+    keyboard['inline_keyboard'].append([{'text': '👨‍💼 Admin Panel', 'callback_data': 'admin_panel'}])
+    return keyboard
+
+def offer_keyboard():
+    """Return offer selection keyboard"""
+    return {
+        'inline_keyboard': [
+            [{'text': 'Offer18', 'callback_data': 'offer_offer18'}],
+            [{'text': 'Second Offer', 'callback_data': 'offer_second'}],
+            [{'text': '⬅️ Back', 'callback_data': 'home'}]
+        ]
+    }
+
+def admin_keyboard():
+    """Return admin panel keyboard"""
+    return {
+        'inline_keyboard': [
+            [{'text': '📊 Stats', 'callback_data': 'admin_stats'}],
+            [{'text': '📢 Broadcast', 'callback_data': 'admin_broadcast'}],
+            [{'text': '🚫 Ban User', 'callback_data': 'admin_ban'}],
+            [{'text': '✅ Unban User', 'callback_data': 'admin_unban'}],
+            [{'text': '📋 Help Requests', 'callback_data': 'admin_help_requests'}],
+            [{'text': '⬅️ Back', 'callback_data': 'home'}]
+        ]
+    }
+
+# ==================== OFFER HANDLING ====================
+
+def extract_clickid_from_url(url):
+    """Extract clickid from URL"""
+    try:
+        parsed_url = urlparse(url)
+        params = parse_qs(parsed_url.query)
+        clickid = params.get('clickid', [None])[0]
+        return clickid
+    except:
+        return None
+
+def send_postback(clickid):
+    """Send postback request to offer server"""
+    try:
+        postback_url = f"{OFFER18_URL}?tid={clickid}"
+        response = requests.get(postback_url, timeout=10)
+        
+        # Return the response
+        if response.status_code == 200:
+            return response.text[:500]  # Limit response length
+        else:
+            return f"Server responded with status: {response.status_code}"
+    except requests.Timeout:
+        return "⏱️ Request timeout. Server took too long to respond."
+    except Exception as e:
+        return f"❌ Error: {str(e)[:200]}"
+
+# ==================== WEBHOOK HANDLER ====================
+
+@app.route(f'/webhook/{TELEGRAM_TOKEN}', methods=['POST'])
+def webhook():
+    """Main webhook handler"""
+    try:
+        update = request.json
+        
+        # Handle messages
+        if 'message' in update:
+            message = update['message']
+            user_id = message['from']['id']
+            username = message['from'].get('username', '')
+            first_name = message['from'].get('first_name', 'User')
+            text = message.get('text', '').strip()
+            
+            # Check if user is banned
+            if is_user_banned(user_id):
+                return 'ok', 200
+            
+            # Get or create user
+            user = get_or_create_user(user_id, username, first_name)
+            
+            # Handle /start command
+            if text == '/start':
+                keyboard = home_keyboard_admin() if user_id == ADMIN_ID else home_keyboard()
+                send_message(
+                    user_id,
+                    f"👋 Welcome <b>{first_name}!</b>\n\n"
+                    "Please join our channel first to use all features.\n\n"
+                    "Select an option below:",
+                    reply_markup=keyboard
+                )
+            
+            # Handle help mode - messages while in help mode
+            elif user.get('current_mode') == 'help_mode' and text:
+                can_send, error_msg = can_send_help_request(user_id)
+                if not can_send:
+                    send_message(user_id, error_msg)
+                else:
+                    add_help_request(user_id, username, text)
+                    
+                    # Send to admin
+                    send_message(
+                        ADMIN_ID,
+                        f"<b>📬 New Help Request</b>\n\n"
+                        f"<b>From:</b> {first_name} (@{username or 'no_username'})\n"
+                        f"<b>User ID:</b> <code>{user_id}</code>\n"
+                        f"<b>Message:</b> {text}\n"
+                        f"<b>Time:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                    )
+                    
+                    send_message(user_id, "✅ Your message has been sent to support. We'll help you soon!")
+                    
+                    # Reset mode
+                    users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': None}})
+            
+            # Handle offer mode - URLs while in offer mode
+            elif user.get('current_mode') == 'offer_mode' and text:
+                if OFFER18_URL in text or 'offer18.com' in text:
+                    clickid = extract_clickid_from_url(text)
+                    if clickid:
+                        response = send_postback(clickid)
+                        send_message(
+                            user_id,
+                            f"<b>✅ Postback Sent</b>\n\n"
+                            f"<b>Clickid:</b> <code>{clickid}</code>\n\n"
+                            f"<b>Server Response:</b>\n<code>{response}</code>",
+                        )
+                    else:
+                        send_message(user_id, "❌ Could not extract <code>clickid</code> from URL. Make sure the URL contains: <code>?clickid=YOUR_ID</code>")
+                else:
+                    send_message(user_id, f"❌ Invalid offer URL. Should contain <code>{OFFER18_URL}</code>")
+                
+                # Reset mode
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': None}})
+            
+            # Handle broadcast mode (admin only)
+            elif user.get('current_mode') == 'broadcast_mode' and user_id == ADMIN_ID and text:
+                all_users = users_collection.find({'is_active': True})
+                success = 0
+                failed = 0
+                
+                for u in all_users:
+                    try:
+                        send_message(u['_id'], f"📢 <b>Announcement</b>\n\n{text}")
+                        success += 1
+                    except:
+                        failed += 1
+                
+                send_message(
+                    user_id,
+                    f"✅ <b>Broadcast Complete</b>\n\n"
+                    f"<b>Sent to:</b> {success} users\n"
+                    f"<b>Failed:</b> {failed} users",
+                    reply_markup=admin_keyboard()
+                )
+                
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': None}})
+            
+            # Handle ban mode (admin only)
+            elif user.get('current_mode') == 'ban_mode' and user_id == ADMIN_ID and text:
+                try:
+                    target_user_id = int(text)
+                    if ban_user(target_user_id):
+                        send_message(user_id, f"✅ User <code>{target_user_id}</code> has been banned!", reply_markup=admin_keyboard())
+                    else:
+                        send_message(user_id, f"⚠️ User <code>{target_user_id}</code> is already banned!", reply_markup=admin_keyboard())
+                except ValueError:
+                    send_message(user_id, "❌ Invalid user ID. Please send only numbers.", reply_markup=admin_keyboard())
+                
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': None}})
+            
+            # Handle unban mode (admin only)
+            elif user.get('current_mode') == 'unban_mode' and user_id == ADMIN_ID and text:
+                try:
+                    target_user_id = int(text)
+                    if unban_user(target_user_id):
+                        send_message(user_id, f"✅ User <code>{target_user_id}</code> has been unbanned!", reply_markup=admin_keyboard())
+                    else:
+                        send_message(user_id, f"⚠️ User <code>{target_user_id}</code> is not banned!", reply_markup=admin_keyboard())
+                except ValueError:
+                    send_message(user_id, "❌ Invalid user ID. Please send only numbers.", reply_markup=admin_keyboard())
+                
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': None}})
+        
+        # Handle callback queries (button clicks)
+        elif 'callback_query' in update:
+            callback = update['callback_query']
+            user_id = callback['from']['id']
+            username = callback['from'].get('username', '')
+            first_name = callback['from'].get('first_name', 'User')
+            callback_data = callback['data']
+            callback_query_id = callback['id']
+            chat_id = callback['message']['chat_id']
+            
+            # Check if user is banned
+            if is_user_banned(user_id):
+                return 'ok', 200
+            
+            # Get or create user
+            user = get_or_create_user(user_id, username, first_name)
+            
+            # Check channel membership for most features
+            if callback_data in ['offers', 'help', 'offer_offer18', 'offer_second']:
+                if not check_channel_membership(user_id, CHANNEL_ID):
+                    answer_callback_query(callback_query_id, "❌ You must join the channel first!", show_alert=True)
+                    send_message(
+                        user_id,
+                        f"❌ <b>Channel Membership Required</b>\n\n"
+                        f"Please join our channel first:\n\n"
+                        f"{CHANNEL_ID}\n\n"
+                        f"After joining, click the button below to verify.",
+                        reply_markup={'inline_keyboard': [[{'text': '✅ Check Membership', 'callback_data': 'check_membership'}]]}
+                    )
+                    return 'ok', 200
+            
+            # Home menu
+            if callback_data == 'home':
+                answer_callback_query(callback_query_id, "")
+                keyboard = home_keyboard_admin() if user_id == ADMIN_ID else home_keyboard()
+                send_message(
+                    user_id,
+                    "🏠 <b>Home Menu</b>\n\nSelect an option:",
+                    reply_markup=keyboard
+                )
+            
+            # Offers menu
+            elif callback_data == 'offers':
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    "🎁 <b>Select an Offer</b>",
+                    reply_markup=offer_keyboard()
+                )
+            
+            # Offer18
+            elif callback_data == 'offer_offer18':
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    f"📎 <b>Offer18</b>\n\n"
+                    f"Send your offer URL with clickid parameter:\n\n"
+                    f"<code>https://offer18.com?clickid=YOUR_CLICKID</code>\n\n"
+                    f"Example:\n<code>https://offer18.com?clickid=abc123def456</code>\n\n"
+                    f"The bot will extract the clickid and send a postback request to the server."
+                )
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': 'offer_mode'}})
+            
+            # Second Offer
+            elif callback_data == 'offer_second':
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    f"📎 <b>Second Offer</b>\n\n"
+                    f"Send your offer URL with clickid parameter.\n\n"
+                    f"(You can customize this offer in the code)"
+                )
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': 'offer_mode'}})
+            
+            # Help & Support
+            elif callback_data == 'help':
+                answer_callback_query(callback_query_id, "")
+                can_send, error_msg = can_send_help_request(user_id)
+                if not can_send:
+                    send_message(user_id, f"⏳ {error_msg}\n\n{CHANNEL_ID}")
+                else:
+                    send_message(
+                        user_id,
+                        f"💬 <b>Help & Support</b>\n\n"
+                        f"Send your question or issue below:\n\n"
+                        f"<b>Note:</b> Maximum 2 messages per day\n"
+                        f"Your message will be sent directly to our support team."
+                    )
+                    users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': 'help_mode'}})
+            
+            # Join Channel
+            elif callback_data == 'join_channel':
+                answer_callback_query(callback_query_id, "")
+                channel_name = CHANNEL_ID.replace('@', '')
+                send_message(
+                    user_id,
+                    f"📢 <b>Join Our Channel</b>\n\n"
+                    f"Click the button below to join our channel:",
+                    reply_markup={'inline_keyboard': [[{'text': '📱 Join Channel', 'url': f'https://t.me/{channel_name}'}]]}
+                )
+            
+            # Check channel membership
+            elif callback_data == 'check_membership':
+                answer_callback_query(callback_query_id, "")
+                if check_channel_membership(user_id, CHANNEL_ID):
+                    send_message(user_id, "✅ <b>Great!</b> You've joined the channel.\n\nNow you can access all features.")
+                    keyboard = home_keyboard_admin() if user_id == ADMIN_ID else home_keyboard()
+                    send_message(user_id, "🏠 Select an option:", reply_markup=keyboard)
+                else:
+                    send_message(user_id, f"❌ You haven't joined the channel yet.\n\nJoin: {CHANNEL_ID}")
+            
+            # Admin Panel
+            elif callback_data == 'admin_panel':
+                if user_id != ADMIN_ID:
+                    answer_callback_query(callback_query_id, "❌ You don't have access!", show_alert=True)
+                    return 'ok', 200
+                
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    "🔧 <b>Admin Panel</b>\n\nSelect an option:",
+                    reply_markup=admin_keyboard()
+                )
+            
+            # Admin - Stats
+            elif callback_data == 'admin_stats':
+                if user_id != ADMIN_ID:
+                    return 'ok', 200
+                
+                answer_callback_query(callback_query_id, "")
+                total_users = get_total_users()
+                banned_users = get_banned_users_count()
+                
+                send_message(
+                    user_id,
+                    f"📊 <b>Bot Statistics</b>\n\n"
+                    f"👥 <b>Total Active Users:</b> <code>{total_users}</code>\n"
+                    f"🚫 <b>Banned Users:</b> <code>{banned_users}</code>\n"
+                    f"📅 <b>Total Users (All):</b> <code>{users_collection.count_documents({})}</code>\n"
+                    f"⏰ <b>Checked At:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                    reply_markup=admin_keyboard()
+                )
+            
+            # Admin - Broadcast
+            elif callback_data == 'admin_broadcast':
+                if user_id != ADMIN_ID:
+                    return 'ok', 200
+                
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    "📢 <b>Broadcast Mode</b>\n\n"
+                    "Send the message you want to broadcast to all users.\n\n"
+                    "Type /cancel to exit this mode."
+                )
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': 'broadcast_mode'}})
+            
+            # Admin - Ban User
+            elif callback_data == 'admin_ban':
+                if user_id != ADMIN_ID:
+                    return 'ok', 200
+                
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    "🚫 <b>Ban User</b>\n\n"
+                    "Send the user ID you want to ban.\n\n"
+                    "Type /cancel to exit this mode."
+                )
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': 'ban_mode'}})
+            
+            # Admin - Unban User
+            elif callback_data == 'admin_unban':
+                if user_id != ADMIN_ID:
+                    return 'ok', 200
+                
+                answer_callback_query(callback_query_id, "")
+                send_message(
+                    user_id,
+                    "✅ <b>Unban User</b>\n\n"
+                    "Send the user ID you want to unban.\n\n"
+                    "Type /cancel to exit this mode."
+                )
+                users_collection.update_one({'_id': user_id}, {'$set': {'current_mode': 'unban_mode'}})
+            
+            # Admin - Help Requests
+            elif callback_data == 'admin_help_requests':
+                if user_id != ADMIN_ID:
+                    return 'ok', 200
+                
+                answer_callback_query(callback_query_id, "")
+                help_requests = list(help_requests_collection.find().sort('created_at', -1).limit(10))
+                
+                if help_requests:
+                    text = "<b>📋 Recent Help Requests (Last 10)</b>\n\n"
+                    for i, req in enumerate(help_requests, 1):
+                        text += (f"<b>{i}. From:</b> {req['username']} (ID: <code>{req['user_id']}</code>)\n"
+                                f"   <b>Message:</b> {req['message'][:100]}{'...' if len(req['message']) > 100 else ''}\n"
+                                f"   <b>Time:</b> {req['created_at'].strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
+                    send_message(user_id, text[:4000], reply_markup=admin_keyboard())  # Telegram 4096 char limit
+                else:
+                    send_message(user_id, "📭 No help requests yet.", reply_markup=admin_keyboard())
+        
+        return 'ok', 200
+    
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        return 'error', 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    try:
+        client.server_info()
+        return {'status': 'ok', 'database': 'connected'}, 200
+    except:
+        return {'status': 'error', 'database': 'disconnected'}, 500
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return {
+        'bot_name': 'Telegram Offer Bot',
+        'version': '1.0.0',
+        'status': 'running',
+        'admin_id': ADMIN_ID,
+        'channel': CHANNEL_ID
+    }, 200
+
+if __name__ == '__main__':
+    # For local testing
+    port = int(os.getenv('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
