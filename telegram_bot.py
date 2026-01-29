@@ -788,7 +788,7 @@ def webhook():
             first_name = callback['from'].get('first_name', 'User')
             callback_data = callback['data']
             callback_query_id = callback['id']
-            chat_id = callback['message']['chat_id']
+            chat_id = callback['message']['chat']['id']
             
             if is_user_banned(user_id):
                 return 'ok', 200
