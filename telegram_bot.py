@@ -405,7 +405,6 @@ def run_postbacks_sequence(clickid, postbacks, delays, user_id):
         send_message(
             user_id,
             f"<b>{status_emoji} Postback {i+1}/{len(postbacks)}</b>\n\n"
-            f"<b>URL:</b> <code>{final_url[:80]}...</code>\n"
             f"<b>Status:</b> {status_code}\n"
             f"<b>Response:</b> <code>{response_text[:200]}</code>\n"
             f"<b>Time:</b> {elapsed}ms"
